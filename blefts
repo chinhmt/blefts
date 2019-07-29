@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import _thread
+import gatt
+from argparse import ArgumentParser
+from hashlib import sha256
+
+FILE_TRANSFER_SVC_UUID = '80ea0c36-db24-4b02-9cf5-f724e640576d'
+
+UPLOAD_CHRC_UUID = '882d7570-e50a-4dde-abb3-01e2c48f09a2'
+UPLOAD_FILE_NAME_DESC_UUID = '8edf6881-ae85-42e1-9457-4665fd05991e'
+UPLOAD_SHA256_DESC_UUID = '8aaa1db8-6d6f-4602-8d92-86a070db3d55'
+UPLOAD_FILE_SIZE_DESC_UUID = '24dbdeb5-01e4-44b1-9b46-5e6ac565ac10'
+
+DOWNLOAD_CHRC_UUID = '82850872-e41a-424a-8f96-2bdd268f4541'
+DOWNLOAD_FILE_LIST_DESC_UUID = '8caa0005-7865-4985-9925-5bd23fb4f902'
+DOWNLOAD_FILE_NAME_DESC_UUID = '97ed2f3e-c375-49a0-acf4-bb551aeb6dc7'
+DOWNLOAD_SHA256_DESC_UUID = '851cc023-55c5-4e39-89f9-9184d0176e44'
+DOWNLOAD_FILE_SIZE_DESC_UUID = 'c72494de-57c0-4b05-b7d6-c4f240f38855'
+
+PAYLOAD_SIZE = 512
+
+args = None
+
+
+class KOOVDevice(gatt.Device):
+    def connect_succeeded(self):
+        super().connect_succeeded()
+        print("[%s] Connected" % (self.mac_address))
+
+    def connect_failed(self, error):
+        super().connect_failed(error)
+        print("[%s] Connection failed: %s" % (self.mac_address, str(error)))
+
+    def disconnect_succeeded(self):
+        super().disconnect_succeeded()
+        print("[%s] Disconnected" % (self.mac_address))
+
+    def services_resolved(self):
+        super().services_resolved()
+
+        global args
+        found_fts = False
+
+        for service in self.services:
+            if service.uuid == FILE_TRANSFER_SVC_UUID:
+                found_fts = True
+                if args.transfer_mode == 'send':
+                    self.send_file(service)
+                elif args.transfer_mode == 'receive':
+                    self.receive_file(service)
+
+        if not found_fts:
+            print("[%s] File Transfer Service not found!" % (self.mac_address))
+            exit()
+
+    def send_file(self, service):
+        global args
+        file_bytes = get_bytes_from_file(args.path)
+        file_size = os.path.getsize(args.path)
+        sha256sum = sha256(file_bytes).hexdigest()
+
+        for characteristic in service.characteristics:
+            if characteristic.uuid == UPLOAD_CHRC_UUID:
+                for descriptor in characteristic.descriptors:
+                    if descriptor.uuid == UPLOAD_FILE_NAME_DESC_UUID:
+                        descriptor.write_value(
+                            os.path.basename(args.path).encode())
+
+                    elif descriptor.uuid == UPLOAD_SHA256_DESC_UUID:
+                        descriptor.write_value(sha256sum.encode())
+
+                    elif descriptor.uuid == UPLOAD_FILE_SIZE_DESC_UUID:
+                        descriptor.write_value(str(file_size).encode())
+
+                characteristic.data = {
+                    'offset': 0,
+                    'process': [],
+                    'file_bytes': file_bytes,
+                    'file_size': file_size,
+                    'start_time': time.time(),
+                }
+
+                try:
+                    _thread.start_new_thread(
+                        self.on_write_characteristic, (characteristic, 3, ))
+                except:
+                    print("Error: unable to start thread")
+
+                break
+
+    def receive_file(self, service):
+        global args
+        file_list = None
+        sha256sum = None
+
+        for characteristic in service.characteristics:
+            if characteristic.uuid == DOWNLOAD_CHRC_UUID:
+                for descriptor in characteristic.descriptors:
+                    if descriptor.uuid == DOWNLOAD_FILE_LIST_DESC_UUID:
+                        file_list_str = bytes(
+                            descriptor.read_value()).decode("utf-8")
+                        file_list = file_list_str.split(";")
+                        print("[%s] Available files: %s" %
+                              (self.mac_address, file_list))
+
+                file_name = ''
+                while file_name not in file_list:
+                    print("[%s] Filename: " %
+                          (self.mac_address), end="")
+                    file_name = input()
+                    file_name = file_name.rstrip()
+
+                for descriptor in characteristic.descriptors:
+                    if descriptor.uuid == DOWNLOAD_FILE_NAME_DESC_UUID:
+                        descriptor.write_value(file_name.encode())
+                        break
+
+                file_dir = ''
+                while not os.path.isdir(file_dir):
+                    print("[%s] Directoty to save %s: " %
+                          (self.mac_address, file_name), end="")
+                    file_dir = input()
+                    file_dir = file_dir.rstrip()
+
+                characteristic.data = {
+                    'process': [],
+                    'file_path': os.path.abspath(file_dir) + "/" + file_name,
+                    'start_time': time.time(),
+                }
+
+                try:
+                    _thread.start_new_thread(
+                        self.on_write_file_name_descriptor, (descriptor, ))
+                except:
+                    print("Error: unable to start thread")
+
+                break
+
+    def descriptor_read_value_succeeded(self, descriptor):
+        descriptor.characteristic.data['process'].append(descriptor.uuid)
+
+    def descriptor_read_value_failed(self, descriptor, error):
+        print("[%s] Fail to read to descriptor %s!" %
+              (self.mac_address, descriptor.uuid))
+        self.manager.stop()
+
+    def descriptor_write_value_succeeded(self, descriptor):
+        descriptor.characteristic.data['process'].append(descriptor.uuid)
+
+    def descriptor_write_value_failed(self, descriptor, error):
+        print("[%s] Fail to write to descriptor %s!" %
+              (self.mac_address, descriptor.uuid))
+        self.manager.stop()
+
+    def characteristic_write_value_succeeded(self, characteristic):
+        characteristic.data['offset'] += 1
+        offset = characteristic.data['offset']
+        file_bytes = characteristic.data['file_bytes']
+        file_size = characteristic.data['file_size']
+
+        start = offset * PAYLOAD_SIZE
+        if start >= file_size:
+            finish_time = time.time()
+            start_time = characteristic.data['start_time']
+            rate = int(file_size / (finish_time - start_time))
+            print("Finish: sent %s B at rate %s B/s." % (file_size, rate))
+
+            self.manager.stop()
+
+        end = start + PAYLOAD_SIZE
+        if end > file_size:
+            end = file_size
+
+        characteristic.write_value(file_bytes[start:end], offset)
+
+    def characteristic_write_value_failed(self, characteristic, error):
+        print("[%s] Fail to write to characteristic %s at %s offset!" %
+              (self.mac_address, characteristic.uuid, characteristic.data['offset'] * PAYLOAD_SIZE))
+        self.manager.stop()
+
+    def on_write_characteristic(self, characteristic, condition):
+        while len(characteristic.data['process']) != condition:
+            time.sleep(0.005)
+
+        file_bytes = characteristic.data['file_bytes']
+        file_size = characteristic.data['file_size']
+        start = 0
+        end = PAYLOAD_SIZE if file_size >= PAYLOAD_SIZE else file_size
+
+        print("Sending file...")
+        characteristic.write_value(file_bytes[start:end], 0)
+
+    def on_write_file_name_descriptor(self, descriptor):
+        while DOWNLOAD_FILE_NAME_DESC_UUID not in descriptor.characteristic.data['process']:
+            time.sleep(0.005)
+
+        file_path = descriptor.characteristic.data['file_path']
+        file_bytes = bytearray()
+        sha256sum = ''
+        file_size = 0
+        finish_time = 0
+
+        for descriptor in descriptor.characteristic.descriptors:
+            if descriptor.uuid == DOWNLOAD_SHA256_DESC_UUID:
+                sha256sum = bytes(descriptor.read_value()).decode("utf-8")
+            elif descriptor.uuid == DOWNLOAD_FILE_SIZE_DESC_UUID:
+                file_size = int(bytes(descriptor.read_value()).decode("utf-8"))
+
+        print("Receiving file...")
+        number_of_chunks = int((file_size - 1) / PAYLOAD_SIZE);
+        mod = file_size % PAYLOAD_SIZE
+        for offset in range(number_of_chunks + 1):
+            chunk_bytes = bytearray(descriptor.characteristic.read_value())
+            if offset == number_of_chunks and mod > 0:
+                chunk_bytes = chunk_bytes[0: mod]
+
+            file_bytes.extend(chunk_bytes)
+
+        finish_time = time.time()
+
+        if sha256sum == sha256(file_bytes).hexdigest():
+            with open(file_path, "wb") as file:
+                file.write(file_bytes)
+
+            start_time = descriptor.characteristic.data['start_time']
+            rate = int(file_size / (finish_time - start_time))
+            print("Finish: receive %s B at rate %s B/s." % (file_size, rate))
+        else:
+            print("[%s] Corrupted file!" % (self.mac_address))
+
+        self.manager.stop()
+
+
+def get_bytes_from_file(file_path):
+    with open(file_path, "rb") as binary_file:
+        return binary_file.read()
+
+
+def main():
+    global args
+
+    arg_parser = ArgumentParser(description="GATT File Transfer")
+    arg_parser.add_argument(
+        '--mac_address', help="MAC address of device to connect")
+    arg_parser.add_argument('--transfer_mode', choices=[
+                            'send', 'receive'], help="Transfer mode: send|receive")
+    arg_parser.add_argument(
+        '--path', nargs='?', help="Path to the file to send")
+    args = arg_parser.parse_args()
+
+    if args.transfer_mode == 'send':
+        if not os.path.isfile(args.path):
+            print("File doesn't exist")
+            exit()
+
+    print("Connecting...")
+    manager = gatt.DeviceManager(adapter_name='hci0')
+    device = KOOVDevice(manager=manager, mac_address=args.mac_address)
+    device.connect()
+
+    try:
+        manager.run()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == '__main__':
+    main()
